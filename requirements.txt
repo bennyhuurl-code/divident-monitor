@@ -1,0 +1,5 @@
+streamlit
+shioaji
+pandas
+requests
+python-dotenv
