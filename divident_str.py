@@ -151,6 +151,7 @@ def calculate_yield(df, price_map, name_map, top_n=0):
     df_copy['name'] = df_copy['code'].map(name_map)
     df_copy['name'] = df_copy['name'].fillna(df_copy['code'])
     
+    # 🔑 截斷名稱
     df_copy['display_name'] = df_copy['name'].apply(truncate_name)
     
     df_copy['yield'] = df_copy.apply(
@@ -387,22 +388,15 @@ def main():
         st.warning("⚠️ 無有效合約，請檢查股票代碼")
         return
     
-    # ============================================================
-    # 核心邏輯：先抓即時，失敗重試，再不行才抓歷史
-    # ============================================================
     price_map, name_map = {}, {}
     mode = "single"
     retry_count = 0
-    
-    # 判斷是否在交易時段內（輔助用）
     is_trading = is_trading_day() and is_trading_hours()
     
     with st.spinner("📊 正在取得股價資料..."):
-        # 步驟 1：抓即時資料
         price_map, name_map = fetch_realtime_prices(api, contracts)
         has_data = any(p is not None for p in price_map.values())
         
-        # 步驟 2：如果無資料且為交易日，重試
         while not has_data and is_trading and retry_count < MAX_RETRY:
             retry_count += 1
             st.info(f"⏳ 等待即時資料（第 {retry_count}/{MAX_RETRY} 次重試）...")
@@ -410,13 +404,10 @@ def main():
             price_map, name_map = fetch_realtime_prices(api, contracts)
             has_data = any(p is not None for p in price_map.values())
         
-        # 步驟 3：最終決定
-        # 🔑 關鍵：同時檢查「有資料」和「在交易時段內」
-        if has_data and is_trading:
+        if has_data:
             mode = "realtime"
             st.session_state.data_source = "🟢 即時資料"
         else:
-            # 無即時資料 或 不在交易時段 → 抓歷史收盤價
             st.info("📂 抓取歷史收盤價...")
             price_map, name_map = fetch_historical_prices(api, contracts)
             has_historical = any(p is not None for p in price_map.values())
@@ -426,13 +417,11 @@ def main():
             else:
                 st.warning("⚠️ 無任何股價資料")
     
-    # ===== 計算殖利率 =====
     df_output = calculate_yield(df, price_map, name_map, top_n)
     
     st.session_state.mode = mode
     st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
     
-    # ===== 顯示統計 =====
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("📊 總筆數", len(df_output))
@@ -447,7 +436,6 @@ def main():
         mode_text = "盤中即時" if mode == "realtime" else "盤後單次"
         st.metric("📌 模式", f"{mode_icon} {mode_text}")
     
-    # ===== 顯示表格 =====
     st.dataframe(
         df_output,
         use_container_width=True,
@@ -463,7 +451,6 @@ def main():
         height=600
     )
     
-    # ===== 底部資訊 =====
     if mode == "realtime":
         st.info(f"🟢 盤中模式：每 {update_interval} 秒自動更新 | 下次更新：{(datetime.now() + timedelta(seconds=update_interval)).strftime('%H:%M:%S')}")
         time.sleep(update_interval)
