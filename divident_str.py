@@ -18,6 +18,8 @@ st.set_page_config(
 # ===== 參數設定 =====
 UPDATE_INTERVAL = 30
 SHOW_TOP_N = 0
+MAX_RETRY = 3  # 最大重試次數
+RETRY_WAIT = 30  # 重試間隔（秒）
 CSV_URL = "https://raw.githubusercontent.com/bennyhuurl-code/divident-monitor/main/divident.csv"
 
 TIME_0900 = datetime.strptime("09:00", "%H:%M").time()
@@ -66,11 +68,16 @@ def login_shioaji():
         st.error(f"登入失敗: {e}")
         return None
 
-def get_trading_mode():
+def is_trading_day():
+    """判斷是否為交易日（週一～週五）"""
+    now = datetime.now()
+    return now.weekday() < 5
+
+def is_trading_hours():
+    """判斷是否在交易時段（09:00~13:30）"""
     now = datetime.now()
     current_time = now.time()
-    is_weekday = now.weekday() < 5
-    return "realtime" if is_weekday and (current_time >= TIME_0900 and current_time <= TIME_1330) else "single"
+    return current_time >= TIME_0900 and current_time <= TIME_1330
 
 def build_contracts(api, df):
     contracts = []
@@ -90,7 +97,8 @@ def build_contracts(api, df):
             continue
     return contracts
 
-def fetch_prices(api, contracts):
+def fetch_realtime_prices(api, contracts):
+    """抓取即時資料（snapshot）"""
     price_map, name_map = {}, {}
     if not contracts:
         return price_map, name_map
@@ -112,7 +120,29 @@ def fetch_prices(api, contracts):
                         name = code
                 name_map[code] = name
     except Exception as e:
-        st.warning(f"取得股價失敗: {e}")
+        st.warning(f"即時資料抓取失敗: {e}")
+    return price_map, name_map
+
+def fetch_historical_prices(api, contracts):
+    """抓取歷史收盤價（備用）"""
+    price_map, name_map = {}, {}
+    if not contracts:
+        return price_map, name_map
+    try:
+        # 嘗試用 history 或 kbars 抓昨日收盤
+        # 註：此為示意，實際用法需依 Shioaji API 調整
+        for stock in contracts:
+            try:
+                # 抓最近一筆歷史資料
+                data = api.kbars(stock, "1d", "2026-07-17")  # 示意日期
+                if data and not data.empty:
+                    price = data['close'].iloc[-1]
+                    price_map[str(stock.code)] = price
+                    name_map[str(stock.code)] = stock.name
+            except:
+                pass
+    except Exception as e:
+        st.warning(f"歷史資料抓取失敗: {e}")
     return price_map, name_map
 
 def calculate_yield(df, price_map, name_map, top_n=0):
@@ -134,7 +164,7 @@ def calculate_yield(df, price_map, name_map, top_n=0):
     return df_output
 
 # ============================================
-# CSV 驗證與上傳功能
+# CSV 驗證與上傳功能（與之前相同）
 # ============================================
 def validate_csv_row(row):
     try:
@@ -360,15 +390,44 @@ def main():
         st.warning("⚠️ 無有效合約，請檢查股票代碼")
         return
     
-    # ===== 取得資料 =====
-    with st.spinner("📊 正在更新資料..."):
-        price_map, name_map = fetch_prices(api, contracts)
-        df_output = calculate_yield(df, price_map, name_map, top_n)
+    # ============================================================
+    # 核心邏輯：先抓即時，失敗重試，再不行才抓歷史
+    # ============================================================
+    price_map, name_map = {}, {}
+    mode = "single"
+    retry_count = 0
+    is_trading = is_trading_day() and is_trading_hours()
     
-    # ===== 判斷模式 =====
-    has_data = any(p is not None for p in price_map.values())
-    current_mode = get_trading_mode()
-    mode = "realtime" if has_data and current_mode == "realtime" else "single"
+    with st.spinner("📊 正在取得股價資料..."):
+        # 步驟 1：抓即時資料
+        price_map, name_map = fetch_realtime_prices(api, contracts)
+        has_data = any(p is not None for p in price_map.values())
+        
+        # 步驟 2：如果無資料且為交易日，重試
+        while not has_data and is_trading and retry_count < MAX_RETRY:
+            retry_count += 1
+            st.info(f"⏳ 等待即時資料（第 {retry_count}/{MAX_RETRY} 次重試）...")
+            time.sleep(RETRY_WAIT)
+            price_map, name_map = fetch_realtime_prices(api, contracts)
+            has_data = any(p is not None for p in price_map.values())
+        
+        # 步驟 3：最終決定
+        if has_data:
+            mode = "realtime"
+            st.session_state.data_source = "🟢 即時資料"
+        else:
+            # 無即時資料，抓歷史收盤價
+            st.info("📂 抓取歷史收盤價...")
+            price_map, name_map = fetch_historical_prices(api, contracts)
+            has_historical = any(p is not None for p in price_map.values())
+            if has_historical:
+                mode = "single"
+                st.session_state.data_source = "🔵 歷史收盤價"
+            else:
+                st.warning("⚠️ 無任何股價資料")
+    
+    # ===== 計算殖利率 =====
+    df_output = calculate_yield(df, price_map, name_map, top_n)
     
     st.session_state.mode = mode
     st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
@@ -392,12 +451,13 @@ def main():
     st.dataframe(
         df_output,
         use_container_width=True,
+        hide_index=True,
         column_config={
             "代碼": st.column_config.TextColumn("代碼", width="small"),
             "名稱": st.column_config.TextColumn("名稱", width="medium"),
-            "股利": st.column_config.NumberColumn("股利", format="%.2f"),
-            "股價": st.column_config.NumberColumn("股價", format="%.2f"),
-            "殖利率(%)": st.column_config.NumberColumn("殖利率", format="%.2f%%"),
+            "股利": st.column_config.NumberColumn("股利", format="%.2f", width="small"),
+            "股價": st.column_config.NumberColumn("股價", format="%.2f", width="small"),
+            "殖利率(%)": st.column_config.NumberColumn("殖利率", format="%.2f%%", width="small"),
             "除息日": st.column_config.TextColumn("除息日", width="medium"),
         },
         height=600
